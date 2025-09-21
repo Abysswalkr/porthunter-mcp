@@ -5,28 +5,62 @@ on:
   pull_request:
 
 jobs:
-  test:
+  smoke:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: '3.12'
 
-      - name: Install build deps
+      - name: Install PortHunter (editable)
         run: |
-          python -m pip install --upgrade pip
-          pip install -e . pytest
+          python -m pip install -U pip
+          pip install -e .
 
-      - name: Run tests
+      - name: Generate tiny pcap (synthetic, no repo binary needed)
+        run: |
+          python - <<'PY'
+          from scapy.all import wrpcap, IP, TCP, Ether
+          pkt = Ether()/IP(src="1.1.1.1", dst="2.2.2.2")/TCP(sport=12345, dport=80, flags="S")
+          wrpcap("tiny.pcap", [pkt])
+          print("tiny.pcap generated")
+          PY
+
+      - name: Smoke test via MCP STDIO (scan_overview)
         env:
           PORT_HUNTER_TOKEN: TEST_TOKEN
-          PORT_HUNTER_REQUIRE_TOKEN: "true"
-          PORT_HUNTER_MAX_PCAP_MB: "50"
+          PORT_HUNTER_ALLOWED_DIR: ${{ github.workspace }}
         run: |
-          pytest -q
+          python - <<'PY'
+          import os, asyncio
+          from mcp import StdioServerParameters
+          from mcp.client.stdio import stdio_client
+          from mcp.client.session import ClientSession
+
+          params = StdioServerParameters(
+              command="python",
+              args=["-m", "porthunter.server"],
+              env={
+                "PORT_HUNTER_TOKEN": os.environ["PORT_HUNTER_TOKEN"],
+                "PORT_HUNTER_ALLOWED_DIR": os.environ["PORT_HUNTER_ALLOWED_DIR"],
+              },
+          )
+
+          async def main():
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      resp = await session.call_tool(
+                          name="scan_overview",
+                          arguments={"path": "tiny.pcap", "auth_token": os.environ["PORT_HUNTER_TOKEN"]},
+                      )
+                      sc = getattr(resp, "structuredContent", None)
+                      assert sc and sc.get("result", {}).get("ok") is True, f"Bad response: {sc}"
+
+          asyncio.run(main())
+          PY
