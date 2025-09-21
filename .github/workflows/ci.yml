@@ -8,6 +8,12 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
 
+    env:
+      PORT_HUNTER_TOKEN: CI_TOKEN
+      PORT_HUNTER_ALLOWED_DIR: ${{ github.workspace }}
+      PORT_HUNTER_REQUIRE_TOKEN: "true"
+      PORT_HUNTER_MAX_PCAP_MB: "50"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -15,52 +21,92 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Install PortHunter (editable)
+      - name: Install package
         run: |
-          python -m pip install -U pip
-          pip install -e .
+          python -m pip install --upgrade pip
+          pip install .  # instala porthunter-mcp y deps
 
-      - name: Generate tiny pcap (synthetic, no repo binary needed)
+      - name: Create tiny PCAP with scapy
         run: |
-          python - <<'PY'
-          from scapy.all import wrpcap, IP, TCP, Ether
-          pkt = Ether()/IP(src="1.1.1.1", dst="2.2.2.2")/TCP(sport=12345, dport=80, flags="S")
-          wrpcap("tiny.pcap", [pkt])
-          print("tiny.pcap generated")
+          python - << 'PY'
+          from scapy.all import IP, TCP, Ether, wrpcap
+          pkt = Ether()/IP(src="1.1.1.1", dst="2.2.2.2")/TCP(dport=80, flags="S")
+          wrpcap("smoke.pcap", [pkt])
+          print("PCAP listo:", "smoke.pcap")
           PY
 
-      - name: Smoke test via MCP STDIO (scan_overview)
-        env:
-          PORT_HUNTER_TOKEN: TEST_TOKEN
-          PORT_HUNTER_ALLOWED_DIR: ${{ github.workspace }}
+      - name: Smoke call tools through MCP (STDIO)
         run: |
-          python - <<'PY'
-          import os, asyncio
+          python - << 'PY'
+          import os, sys, json, asyncio
+          from typing import Any, Dict
           from mcp import StdioServerParameters
           from mcp.client.stdio import stdio_client
           from mcp.client.session import ClientSession
 
-          params = StdioServerParameters(
-              command="python",
+          TOKEN = os.environ["PORT_HUNTER_TOKEN"]
+
+          def _mk_params() -> StdioServerParameters:
+            env = {
+              "PORT_HUNTER_TOKEN": TOKEN,
+              "PORT_HUNTER_ALLOWED_DIR": os.environ["PORT_HUNTER_ALLOWED_DIR"],
+              "PORT_HUNTER_REQUIRE_TOKEN": os.getenv("PORT_HUNTER_REQUIRE_TOKEN","true"),
+              "PORT_HUNTER_MAX_PCAP_MB": os.getenv("PORT_HUNTER_MAX_PCAP_MB","50")
+            }
+            return StdioServerParameters(
+              command=sys.executable,
               args=["-m", "porthunter.server"],
-              env={
-                "PORT_HUNTER_TOKEN": os.environ["PORT_HUNTER_TOKEN"],
-                "PORT_HUNTER_ALLOWED_DIR": os.environ["PORT_HUNTER_ALLOWED_DIR"],
-              },
-          )
+              env=env,
+            )
 
-          async def main():
-              async with stdio_client(params) as (read, write):
-                  async with ClientSession(read, write) as session:
-                      await session.initialize()
-                      resp = await session.call_tool(
-                          name="scan_overview",
-                          arguments={"path": "tiny.pcap", "auth_token": os.environ["PORT_HUNTER_TOKEN"]},
-                      )
-                      sc = getattr(resp, "structuredContent", None)
-                      assert sc and sc.get("result", {}).get("ok") is True, f"Bad response: {sc}"
+          def _content_to_dict(resp) -> Dict[str, Any]:
+            # 1) Preferir structuredContent si existe
+            sc = getattr(resp, "structuredContent", None)
+            if sc:
+              # Server suele poner su payload en "result"
+              if isinstance(sc, dict) and "result" in sc:
+                return sc["result"]
+              return sc
+            # 2) Fallback: juntar texto de resp.content y parsear JSON
+            txt = ""
+            for c in getattr(resp, "content", []):
+              # elementos tipo TextContent: tienen .type y .text
+              t = getattr(c, "type", None)
+              if t == "text":
+                txt += getattr(c, "text", "")
+            if not txt:
+              raise RuntimeError("Respuesta sin structuredContent ni texto")
+            return json.loads(txt)
 
-          asyncio.run(main())
+          async def smoke():
+            params = _mk_params()
+            async with stdio_client(params) as (read, write):
+              async with ClientSession(read, write) as session:
+                await session.initialize()
+
+                # get_info
+                r = await session.call_tool("get_info", {"auth_token": TOKEN})
+                d = _content_to_dict(r)
+                assert d.get("ok") is True, f"get_info not ok: {d}"
+
+                # scan_overview
+                r = await session.call_tool("scan_overview", {"path": "smoke.pcap", "auth_token": TOKEN})
+                d = _content_to_dict(r)
+                assert d.get("ok") is True, f"scan_overview not ok: {d}"
+
+                # enrich_ip -> inválida debe devolver ok False
+                r = await session.call_tool("enrich_ip", {"ip":"999.999.1.1", "auth_token": TOKEN})
+                d = _content_to_dict(r)
+                assert d.get("ok") is False and d.get("error") == "invalid_ip", f"enrich_ip expected invalid_ip: {d}"
+
+                # correlate: inválida + privada + pública
+                r = await session.call_tool("correlate", {"ips":["abc","192.168.0.10","8.8.8.8"], "auth_token": TOKEN})
+                d = _content_to_dict(r)
+                assert d.get("ok") is True, f"correlate not ok: {d}"
+
+                print(json.dumps({"ok": True, "smoke": "passed"}, indent=2))
+
+          asyncio.run(smoke())
           PY
