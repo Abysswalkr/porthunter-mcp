@@ -7,12 +7,7 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-
-    env:
-      PORT_HUNTER_TOKEN: CI_TOKEN
-      PORT_HUNTER_ALLOWED_DIR: ${{ github.workspace }}
-      PORT_HUNTER_REQUIRE_TOKEN: "true"
-      PORT_HUNTER_MAX_PCAP_MB: "50"
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -26,113 +21,63 @@ jobs:
       - name: Install deps (package + tools used by smoke)
         run: |
           python -m pip install -U pip
-          # Instalamos tu paquete y libs que usa el smoke (por si no están como deps del paquete)
-          pip install . mcp scapy requests
+          # Instala tu paquete en editable y las libs que usa el smoke
+          python -m pip install -e .
+          python -m pip install mcp anyio scapy pytest
 
       - name: Print versions for debugging
         run: |
-          python -c "import sys,platform;print('Python:',sys.version);print('OS:',platform.platform())"
-          python -c "import mcp,scapy;print('mcp:',mcp.__version__);print('scapy:',scapy.__version__)"
-          python -c "import porthunter, json; print('PortHunter package OK')"
+          python - <<'PY'
+          import sys, platform, importlib.metadata as il
+          def v(name):
+              try:
+                  return il.version(name)
+              except Exception:
+                  return "n/a"
+          print("Python:", sys.version)
+          print("OS:", platform.platform())
+          for pkg in ["porthunter", "mcp", "anyio", "scapy", "pytest"]:
+              print(f"{pkg}: {v(pkg)}")
+          PY
 
       - name: Generate tiny PCAP (scapy)
         run: |
-          python - << 'PY'
-          from scapy.all import IP, TCP, Ether, wrpcap
-          pkt = Ether()/IP(src="1.1.1.1", dst="2.2.2.2")/TCP(dport=80, flags="S")
-          wrpcap("smoke.pcap", [pkt])
-          print("smoke.pcap generated")
+          python - <<'PY'
+          from scapy.all import Ether, IP, TCP, wrpcap
+          pkts = []
+          # 3 SYN de un "scanner" fake hacia un host interno
+          for dport in (22, 80, 443):
+              pkts.append(Ether()/IP(src="192.168.0.10", dst="10.0.0.5")/TCP(sport=44444, dport=dport, flags="S"))
+          wrpcap("tiny.pcap", pkts)
+          print("Wrote tiny.pcap with", len(pkts), "pkts")
           PY
+
+      - name: Start PortHunter (STDIO) in background
+        env:
+          PORT_HUNTER_TOKEN: TEST_TOKEN
+          PORT_HUNTER_ALLOWED_DIR: ${{ github.workspace }}
+        run: |
+          # Ejecuta el servidor en segundo plano y espera a que levante
+          python -u -m porthunter.server > server.log 2>&1 &
+          echo $! > server.pid
+          sleep 2
+          echo "Server PID:"
+          cat server.pid
 
       - name: Smoke test via MCP STDIO
+        env:
+          PORT_HUNTER_TOKEN: TEST_TOKEN
+          PORT_HUNTER_ALLOWED_DIR: ${{ github.workspace }}
         run: |
-          set -eu
-          python - << 'PY'
-          import os, sys, json, asyncio, re
-          from typing import Any, Dict
-          from mcp import StdioServerParameters
-          from mcp.client.stdio import stdio_client
-          from mcp.client.session import ClientSession
+          python scripts/benchmark_porthunter.py tiny.pcap
 
-          TOKEN = os.environ["PORT_HUNTER_TOKEN"]
+      - name: Show server log on failure
+        if: failure()
+        run: |
+          echo "---- server.log ----"
+          cat server.log || true
 
-          def params():
-            return StdioServerParameters(
-              command=sys.executable,
-              args=["-m", "porthunter.server"],
-              env={
-                "PORT_HUNTER_TOKEN": TOKEN,
-                "PORT_HUNTER_ALLOWED_DIR": os.environ["PORT_HUNTER_ALLOWED_DIR"],
-                "PORT_HUNTER_REQUIRE_TOKEN": os.getenv("PORT_HUNTER_REQUIRE_TOKEN","true"),
-                "PORT_HUNTER_MAX_PCAP_MB": os.getenv("PORT_HUNTER_MAX_PCAP_MB","50"),
-              },
-            )
-
-          def robust_json_parse(text: str) -> Dict[str, Any]:
-            """
-            Intenta extraer el ÚLTIMO objeto JSON del texto (por si vienen logs antes/después).
-            """
-            # buscar último bloque {...}
-            starts = [m.start() for m in re.finditer(r"\{", text)]
-            ends   = [m.start() for m in re.finditer(r"\}", text)]
-            for s in reversed(starts):
-              for e in reversed(ends):
-                if e > s:
-                  chunk = text[s:e+1]
-                  try:
-                    return json.loads(chunk)
-                  except Exception:
-                    continue
-            raise ValueError(f"No se pudo extraer JSON de:\n{text}")
-
-          def to_dict(resp) -> Dict[str, Any]:
-            sc = getattr(resp, "structuredContent", None)
-            if sc:
-              # a veces el server mete el payload en result, y a veces result es string JSON
-              if isinstance(sc, dict) and "result" in sc:
-                v = sc["result"]
-                if isinstance(v, str):
-                  try:
-                    return json.loads(v)
-                  except Exception:
-                    return robust_json_parse(v)
-                return v if isinstance(v, dict) else sc
-              return sc if isinstance(sc, dict) else {}
-            # fallback: juntar texto
-            txt = "".join(getattr(c, "text", "") for c in getattr(resp, "content", []) if getattr(c, "type", "")=="text")
-            if not txt:
-              raise RuntimeError("Respuesta sin structuredContent ni texto")
-            try:
-              return json.loads(txt)
-            except Exception:
-              return robust_json_parse(txt)
-
-          async def main():
-            async with stdio_client(params()) as (r, w):
-              async with ClientSession(r, w) as s:
-                await s.initialize()
-
-                print("== call get_info ==")
-                d = to_dict(await s.call_tool("get_info", {"auth_token": TOKEN}))
-                print(d)
-                assert d.get("ok") is True, f"get_info: {d}"
-
-                print("== call scan_overview ==")
-                d = to_dict(await s.call_tool("scan_overview", {"path":"smoke.pcap","auth_token": TOKEN}))
-                print(d)
-                assert d.get("ok") is True, f"scan_overview: {d}"
-
-                print("== call enrich_ip (invalid) ==")
-                d = to_dict(await s.call_tool("enrich_ip", {"ip":"999.999.1.1","auth_token": TOKEN}))
-                print(d)
-                assert d.get("ok") is False and d.get("error")=="invalid_ip", f"enrich_ip: {d}"
-
-                print("== call correlate ==")
-                d = to_dict(await s.call_tool("correlate", {"ips":["abc","192.168.0.10","8.8.8.8"],"auth_token": TOKEN}))
-                print(d)
-                assert d.get("ok") is True, f"correlate: {d}"
-
-                print("SMOKE OK")
-
-          asyncio.run(main())
-          PY
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then kill $(cat server.pid) || true; fi
