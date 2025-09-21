@@ -1,0 +1,66 @@
+{
+  "name": "PortHunter MCP",
+  "version": "0.1.0",
+  "description": "Servidor MCP local que analiza PCAPs para detectar port scans (SYN/FIN/NULL/Xmas), ranking de sospechosos y primer evento.",
+  "tools": [
+    {
+      "name": "scan_overview",
+      "description": "Resumen de tráfico sospechoso de port scan: top scanners, targets y distribución de puertos.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "Ruta del archivo PCAP"},
+          "time_window_s": {"type": "integer", "default": 60, "minimum": 10},
+          "top_k": {"type": "integer", "default": 20, "minimum": 1}
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "list_suspects",
+      "description": "Lista priorizada de IPs sospechosas de escaneo con evidencia básica.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string"},
+          "min_ports": {"type": "integer", "default": 10, "minimum": 1},
+          "min_rate_pps": {"type": "number", "default": 5}
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "first_scan_event",
+      "description": "Primer evento de escaneo identificado cronológicamente.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string"}
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "enrich_ip",
+      "description": "Enriquece una IP con OTX/GreyNoise/ASN/Geo (mock en esta entrega).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ip": {"type": "string"}
+        },
+        "required": ["ip"]
+      }
+    },
+    {
+      "name": "correlate",
+      "description": "Calcula threat_score(0–100) combinando evidencia local y TI (mock).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ips": { "type": "array", "items": {"type": "string"} }
+        },
+        "required": ["ips"]
+      }
+    }
+  ]
+}

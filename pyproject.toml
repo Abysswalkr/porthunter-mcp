@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "porthunter-mcp"
+version = "0.1.0"
+description = "Local MCP server for port-scan analysis (PCAP/PCAPNG): SYN/FIN/NULL/Xmas detection, suspects, first scan event, IP enrichment."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Tu Nombre" }]
+license = { text = "MIT" }
+dependencies = [
+  "mcp>=1.1",
+  "anyio>=4.0",
+  "scapy>=2.5.0",
+  "ipwhois>=1.2.0",
+  "requests>=2.32.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/Abysswalkr/porthunter-mcp.git"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["porthunter*"]
