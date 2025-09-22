@@ -1,5 +1,4 @@
 name: CI
-
 on:
   push:
   pull_request:
@@ -7,77 +6,49 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Install deps (package + tools used by smoke)
+          python-version: '3.12'
+      - name: Install deps
         run: |
           python -m pip install -U pip
-          # Instala tu paquete en editable y las libs que usa el smoke
-          python -m pip install -e .
-          python -m pip install mcp anyio scapy pytest
-
-      - name: Print versions for debugging
-        run: |
-          python - <<'PY'
-          import sys, platform, importlib.metadata as il
-          def v(name):
-              try:
-                  return il.version(name)
-              except Exception:
-                  return "n/a"
-          print("Python:", sys.version)
-          print("OS:", platform.platform())
-          for pkg in ["porthunter", "mcp", "anyio", "scapy", "pytest"]:
-              print(f"{pkg}: {v(pkg)}")
-          PY
-
-      - name: Generate tiny PCAP (scapy)
-        run: |
-          python - <<'PY'
-          from scapy.all import Ether, IP, TCP, wrpcap
-          pkts = []
-          # 3 SYN de un "scanner" fake hacia un host interno
-          for dport in (22, 80, 443):
-              pkts.append(Ether()/IP(src="192.168.0.10", dst="10.0.0.5")/TCP(sport=44444, dport=dport, flags="S"))
-          wrpcap("tiny.pcap", pkts)
-          print("Wrote tiny.pcap with", len(pkts), "pkts")
-          PY
-
-      - name: Start PortHunter (STDIO) in background
+          pip install -e .
+          pip install anyio mcp
+      - name: Smoke via STDIO
         env:
           PORT_HUNTER_TOKEN: TEST_TOKEN
           PORT_HUNTER_ALLOWED_DIR: ${{ github.workspace }}
         run: |
-          # Ejecuta el servidor en segundo plano y espera a que levante
-          python -u -m porthunter.server > server.log 2>&1 &
-          echo $! > server.pid
-          sleep 2
-          echo "Server PID:"
-          cat server.pid
+          python - << 'PY'
+          import json, asyncio
+          from mcp.client.stdio import stdio_client
+          from mcp.client.session import ClientSession
+          async def main():
+              async with stdio_client({"command":"python","args":["-m","porthunter.server"]}) as (r,w):
+                  async with ClientSession(r,w) as s:
+                      await s.initialize()
+                      res = await s.call_tool("get_info", {"auth_token":"TEST_TOKEN"})
+                      print(json.dumps(res.result))
+          asyncio.run(main())
+          PY
 
-      - name: Smoke test via MCP STDIO
+  tests:
+    runs-on: ubuntu-latest
+    needs: smoke
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -e .
+          pip install anyio mcp pytest
+      - name: Run pytest
         env:
           PORT_HUNTER_TOKEN: TEST_TOKEN
           PORT_HUNTER_ALLOWED_DIR: ${{ github.workspace }}
-        run: |
-          python scripts/benchmark_porthunter.py tiny.pcap
-
-      - name: Show server log on failure
-        if: failure()
-        run: |
-          echo "---- server.log ----"
-          cat server.log || true
-
-      - name: Stop server
-        if: always()
-        run: |
-          if [ -f server.pid ]; then kill $(cat server.pid) || true; fi
+        run: pytest -q
