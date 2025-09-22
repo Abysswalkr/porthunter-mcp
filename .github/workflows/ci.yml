@@ -1,4 +1,5 @@
 name: CI
+
 on:
   push:
   pull_request:
@@ -8,47 +9,103 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - name: Install deps
+          python-version: "3.12"
+
+      - name: Install dependencies
         run: |
           python -m pip install -U pip
           pip install -e .
-          pip install anyio mcp
-      - name: Smoke via STDIO
+          pip install -U anyio mcp
+
+      - name: Smoke MCP server (get_info)
         env:
-          PORT_HUNTER_TOKEN: TEST_TOKEN
+          PORT_HUNTER_TOKEN: CI_TOKEN
           PORT_HUNTER_ALLOWED_DIR: ${{ github.workspace }}
         run: |
           python - << 'PY'
-          import json, asyncio
-          from mcp.client.stdio import stdio_client
+          import os, sys, asyncio, json
           from mcp.client.session import ClientSession
+          from mcp.client.stdio import stdio_client
+          try:
+              from mcp.client.stdio import StdioServerParameters
+          except Exception:
+              StdioServerParameters = None  # compat
+
+          def server_params():
+              env = {
+                  "PORT_HUNTER_TOKEN": os.environ.get("PORT_HUNTER_TOKEN", "CI_TOKEN"),
+                  "PORT_HUNTER_ALLOWED_DIR": os.environ.get("PORT_HUNTER_ALLOWED_DIR", os.getcwd()),
+              }
+              py = sys.executable
+              if StdioServerParameters is not None:
+                  return StdioServerParameters(command=py, args=["-m", "porthunter.server"], env=env)
+              else:
+                  # compat para versiones antiguas del SDK (si stdio_client lo soporta)
+                  return {"command": py, "args": ["-m", "porthunter.server"], "env": env}
+
+          def normalize(res):
+              # 1) API nueva: objeto con .content => TextContent(text='{...}')
+              content = getattr(res, "content", None)
+              if isinstance(content, list):
+                  for item in content:
+                      text = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
+                      if isinstance(text, str):
+                          try:
+                              return json.loads(text)
+                          except Exception:
+                              pass
+
+              # 2) Formato viejo: dict con "result" (str JSON o dict)
+              if isinstance(res, dict) and "result" in res:
+                  inner = res["result"]
+                  if isinstance(inner, dict):
+                      return inner
+                  if isinstance(inner, str):
+                      try:
+                          return json.loads(inner)
+                      except Exception:
+                          return {"raw": inner}
+
+              # 3) Fallback
+              return {"raw": repr(res)}
+
           async def main():
-              async with stdio_client({"command":"python","args":["-m","porthunter.server"]}) as (r,w):
-                  async with ClientSession(r,w) as s:
-                      await s.initialize()
-                      res = await s.call_tool("get_info", {"auth_token":"TEST_TOKEN"})
-                      print(json.dumps(res.result))
+              params = server_params()
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      res = await session.call_tool("get_info", {"auth_token": os.environ["PORT_HUNTER_TOKEN"]})
+                      data = normalize(res)
+                      assert isinstance(data, dict)
+                      assert data.get("ok") is True, f"Unexpected response: {data}"
+                      print(json.dumps(data, indent=2))
+
           asyncio.run(main())
           PY
 
   tests:
     runs-on: ubuntu-latest
-    needs: smoke
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - name: Install deps
+          python-version: "3.12"
+
+      - name: Install test dependencies
         run: |
           python -m pip install -U pip
           pip install -e .
-          pip install anyio mcp pytest
+          pip install -U pytest anyio mcp
+
       - name: Run pytest
         env:
-          PORT_HUNTER_TOKEN: TEST_TOKEN
+          PORT_HUNTER_TOKEN: CI_TOKEN
           PORT_HUNTER_ALLOWED_DIR: ${{ github.workspace }}
-        run: pytest -q
+        run: |
+          python -m pytest -q
